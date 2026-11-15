@@ -1,0 +1,369 @@
+"""Shared test infrastructure for the whole suite.
+
+Security rules enforced here (per docs/conventions.md and docs/test-gaps.md):
+
+- Tests must never hit the network. The Razorpay client is always mocked
+  (``razorpay_mock``) and the settings are pointed at throwaway dummy keys so
+  that even an accidentally un-mocked client cannot use the real credentials
+  from ``.env`` (V-01 containment).
+- Email is delivered via the in-memory locmem backend so registration /
+  verification / reset flows can never talk to a real SMTP host.
+- Password hashing uses the fast MD5 hasher (test-only speed-up; production
+  settings are untouched).
+"""
+
+from datetime import timedelta
+from decimal import Decimal
+from pathlib import Path
+from tempfile import mkdtemp
+from unittest.mock import patch
+
+import razorpay
+from django.contrib.auth.models import User
+from django.core import mail
+from django.core.cache import cache, caches
+from django.db import connection
+from django.test import TestCase, override_settings
+from django.utils import timezone
+from rest_framework.test import APIClient
+
+from accounts.models import TOTPDevice
+from common import totp
+from common.permissions import is_privileged
+
+TEST_RAZORPAY_KEY_ID = "rzp_test_TESTINGONLYDO NOTUSE"
+TEST_RAZORPAY_KEY_SECRET = "TESTINGONLYSECRET-DO-NOT-USE"
+# Fixture TOTP secret (the RFC 6238 vector key, recognizably not a real
+# credential): api_login enrolls it for privileged users so the suite's
+# staff logins keep working under mandatory MFA (SPEC-17-05) without every
+# fixture growing device-setup code.
+TEST_TOTP_SECRET = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+# Test uploads must never land in the developer's real media/ directory.
+TEST_MEDIA_ROOT = Path(mkdtemp(prefix="perfume-tests-media-"))
+
+ApiSettings = override_settings(
+    EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+    RAZORPAY_KEY_ID=TEST_RAZORPAY_KEY_ID,
+    RAZORPAY_KEY_SECRET=TEST_RAZORPAY_KEY_SECRET,
+    PASSWORD_HASHERS=["django.contrib.auth.hashers.MD5PasswordHasher"],
+    MEDIA_ROOT=TEST_MEDIA_ROOT,
+)
+
+
+@ApiSettings
+class ApiTestCase(TestCase):
+    """Base class for every API test in the project."""
+
+    # DRF client: JSON payloads + credentials() support; sessions/cookies
+    # keep working because APIClient extends django.test.Client.
+    client_class = APIClient
+
+    def _pre_setup(self):
+        super()._pre_setup()
+        # Scoped throttles keep their request history in the default cache,
+        # which lives for the whole test run; reset it per test so a rate
+        # limit engaged in one test can never 429 another (deterministic
+        # suite, independent of throttle rates in settings). The alerts
+        # alias carries the cooldown window, so it is reset too.
+        cache.clear()
+        caches["alerts"].clear()
+
+    # ------------------------------------------------------------------
+    # Factories
+    # ------------------------------------------------------------------
+
+    def make_user(
+        self,
+        username="buyer",
+        password="S3cure-Passphrase!",
+        email=None,
+        is_active=True,
+    ):
+        return User.objects.create_user(
+            username=username,
+            email=email or f"{username}@example.com",
+            password=password,
+            is_active=is_active,
+        )
+
+    def make_staff(self, username="staff", password="S3cure-Passphrase!"):
+        # SPEC-6-03c: API write authority flows from the roles map, so the
+        # shared staff fixture holds the admin role — the role-map equivalent
+        # of the legacy blanket is_staff authority it replaces.
+        from django.contrib.auth.models import Group
+
+        from common.roles import ROLE_ADMIN
+
+        user = User.objects.create_user(
+            username=username,
+            email=f"{username}@example.com",
+            password=password,
+            is_staff=True,
+        )
+        user.groups.add(Group.objects.get_or_create(name=ROLE_ADMIN)[0])
+        return user
+
+    def make_product(
+        self,
+        name="Rose Aurum",
+        price="499.99",
+        stock=10,
+        category="Floral",
+        **overrides,
+    ):
+        from products.models import products
+
+        fields = dict(
+            name=name,
+            description="A fragrance with rose and musk notes.",
+            price=Decimal(price),
+            size=50,
+            stock=stock,
+            category=category,
+        )
+        fields.update(overrides)
+        return products.objects.create(**fields)
+
+    def make_coupon(
+        self,
+        code="SAVE10",
+        discount_type="percentage",
+        discount_value="10",
+        minimum_order_amount="0",
+        maximum_discount=None,
+        active=True,
+        usage_limit=None,
+        used_count=0,
+        **overrides,
+    ):
+        from orders.models import Coupon
+
+        fields = dict(
+            code=code,
+            discount_type=discount_type,
+            discount_value=Decimal(discount_value),
+            minimum_order_amount=Decimal(minimum_order_amount),
+            maximum_discount=Decimal(maximum_discount)
+            if maximum_discount is not None
+            else None,
+            active=active,
+            valid_from=timezone.now() - timedelta(days=1),
+            valid_until=timezone.now() + timedelta(days=1),
+            usage_limit=usage_limit,
+            used_count=used_count,
+        )
+        fields.update(overrides)
+        return Coupon.objects.create(**fields)
+
+    # ------------------------------------------------------------------
+    # Clients / auth helpers
+    # ------------------------------------------------------------------
+
+    def fresh_client(self):
+        """A second APIClient with its own independent cookie jar/session."""
+        return APIClient()
+
+    def auth(self, token):
+        """Set (or clear, with None) the JWT bearer on the default client."""
+        if token is None:
+            self.client.credentials()
+        else:
+            self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    def api_login(self, username="buyer", password="S3cure-Passphrase!", client=None):
+        """POST /api/accounts/login/ and attach the returned access token to
+        the client that performed the login (default: self.client).
+
+        SPEC-17-05: privileged users (superusers / staff.manage holders)
+        cannot log in without a valid TOTP code, so the helper lazily
+        ensures the fixture device exists and attaches a fresh code for the
+        current step. The replay watermark is rewound one step first so the
+        code is always acceptable even when an earlier login in the same
+        30-second step already consumed it — that guard is production
+        behaviour being deliberately accommodated, not bypassed."""
+        target = client or self.client
+        payload = {"username": username, "password": password}
+        user = User.objects.filter(username=username).first()
+        if user is not None and is_privileged(user):
+            device = TOTPDevice.objects.filter(
+                user=user, enabled=True, confirmed_at__isnull=False
+            ).first()
+            if device is None:
+                device, _ = TOTPDevice.objects.update_or_create(
+                    user=user,
+                    defaults={
+                        "secret": TEST_TOTP_SECRET,
+                        "enabled": True,
+                        "confirmed_at": timezone.now(),
+                        "last_used_counter": None,
+                    },
+                )
+            counter = totp.now() // totp.STEP
+            device.last_used_counter = counter - 1
+            device.save(update_fields=["last_used_counter"])
+            payload["totp"] = totp.totp(device.secret, counter * totp.STEP)
+        res = target.post("/api/accounts/login/", payload, format="json")
+        token = res.data.get("access") if res.status_code == 200 else None
+        if token:
+            target.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+        return res, token
+
+    def register_and_verify(
+        self, username="buyer", password="S3cure-Passphrase!", email=None
+    ):
+        """Full registration through the API: register -> verify email link."""
+        email = email or f"{username}@example.com"
+        res = self.client.post(
+            "/api/accounts/register/",
+            {"username": username, "email": email, "password": password},
+            format="json",
+        )
+        self.assertIn(res.status_code, (200, 201), res.data)
+        self.assertEqual(len(mail.outbox), 1)
+        uid, token = extract_link_params(mail.outbox[0].body, "verify-email")
+        res = self.client.post(
+            "/api/accounts/verify-email/",
+            {"uid": uid, "token": token},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200, res.data)
+        return User.objects.get(username=username)
+
+    # ------------------------------------------------------------------
+    # Cart / checkout helpers
+    # ------------------------------------------------------------------
+
+    def current_cart(self, client=None):
+        """The cart the given client's requests resolve to (D-04a).
+
+        An APIClient carrying a JWT owns that account's cart; anything else
+        owns the cart keyed by its session cookie. Tests that used to look a
+        cart up by ``session_id`` after a login now ask for the cart the
+        request actually resolves, which keeps the assertion honest without
+        duplicating ``resolve_cart``'s rules in every module.
+        """
+        import base64
+        import json
+
+        from cart.models import Cart
+
+        client = client or self.client
+        header = (getattr(client, "_credentials", None) or {}).get(
+            "HTTP_AUTHORIZATION", ""
+        )
+        if header.startswith("Bearer "):
+            payload = header.split(" ", 1)[1].split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            return Cart.objects.get(user_id=claims["user_id"])
+        return Cart.objects.get(session_id=client.session.session_key)
+
+    def seed_session_cart(self, items, client=None):
+        """Build a session cart through the public cart API.
+
+        ``items`` is an iterable of (product, quantity) tuples.
+        Returns the cart representation.
+        """
+        client = client or self.client
+        res = client.get("/api/cart/")
+        self.assertEqual(res.status_code, 200, res.data)
+        for product, quantity in items:
+            res = client.post(
+                "/api/cart/",
+                {"product_id": product.id, "quantity": quantity},
+                format="json",
+            )
+            self.assertEqual(res.status_code, 201, res.data)
+        return res.data
+
+    def checkout_payload(self, **overrides):
+        payload = {
+            "full_name": "Buyer Person",
+            "phone": "9876543210",
+            "address": "12 Rose Lane",
+            "city": "Mumbai",
+            "state": "Maharashtra",
+            "pincode": "400001",
+        }
+        payload.update(overrides)
+        return payload
+
+    def checkout(self, client=None, **overrides):
+        client = client or self.client
+        return client.post(
+            "/api/orders/checkout/", self.checkout_payload(**overrides), format="json"
+        )
+
+    # ------------------------------------------------------------------
+    # Razorpay fakes (never touch the network)
+    # ------------------------------------------------------------------
+
+    def razorpay_mock(self, order_id="order_TEST0001"):
+        """Patch orders.views.razorpay.Client with a MagicMock.
+
+        Returns the mock client *instance*. ``order.create`` yields
+        ``{"id": order_id}`` and signature verification passes by default.
+        """
+        patcher = patch("orders.views.razorpay.Client")
+        client_cls = patcher.start()
+        self.addCleanup(patcher.stop)
+        client = client_cls.return_value
+        client.order.create.return_value = {"id": order_id}
+        client.utility.verify_payment_signature.return_value = None
+        return client
+
+    def razorpay_fail_signature(self, client_mock):
+        client_mock.utility.verify_payment_signature.side_effect = (
+            razorpay.errors.SignatureVerificationError("invalid signature")
+        )
+
+
+def covering_indexes(model, column):
+    """Every index/constraint the database reports on exactly ``column``.
+
+    Keyed by the name the database gives it, so a caller can tell one index
+    from another without relying on dict order.
+    """
+    with connection.cursor() as cursor:
+        constraints = connection.introspection.get_constraints(
+            cursor, model._meta.db_table
+        )
+    return {
+        name: info for name, info in constraints.items() if info["columns"] == [column]
+    }
+
+
+def redundant_covering_indexes(model, column):
+    """Covering indexes that are neither unique nor the engine's own LIKE index.
+
+    Django gives every indexed ``varchar``/``text`` column a SECOND,
+    deliberately non-unique index with the ``varchar_pattern_ops`` operator
+    class, so that ``icontains`` can use an index under a non-C collation.
+    PostgreSQL creates it; SQLite does not, and its introspection never
+    surfaces one. So "every covering index is unique" is not a portable
+    invariant, and asserting it makes a correct schema look redundant on one
+    engine only.
+
+    What IS portable is the intent behind the assertion - no *duplicate*
+    index stacked on top of a column's UNIQUE constraint - so the engine's
+    own LIKE index is named by asking the backend to generate the name it
+    would have generated, rather than by hardcoding a digest. Anything left
+    over is an index a human added, which is what the pin is for.
+    """
+    like_name = connection.schema_editor()._create_index_name(
+        model._meta.db_table, [column], suffix="_like"
+    )
+    return {
+        name: info
+        for name, info in covering_indexes(model, column).items()
+        if not info["unique"] and name != like_name
+    }
+
+
+def extract_link_params(body, hint):
+    """Pull ``uid`` and ``token`` out of a verification/reset email link."""
+    import re
+
+    match = re.search(rf"{hint}\?uid=([^&\s]+)&token=([^&\s]+)", body)
+    assert match, f"No {hint} link found in email body:\n{body}"
+    return match.group(1), match.group(2)

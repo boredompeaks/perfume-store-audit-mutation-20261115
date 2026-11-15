@@ -1,0 +1,253 @@
+name: audit-mutation-all
+
+# One-time, pre-launch mutation campaign. NOT a merge gate.
+# Sharded by flow/cohesion so no single job carries the whole suite.
+# Public scratch repo: GitHub-hosted runner minutes are not capped for public
+# repositories. Each job is independent; a survivor is information, not a red
+# build. A non-zero exit means the harness broke (red baseline, missing tool).
+
+on:
+  workflow_dispatch:
+    inputs:
+      shard:
+        description: "Optional single shard name; empty = all shards"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  mutate:
+    if: ${{ github.event.inputs.shard == '' || github.event.inputs.shard == matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: auth-accounts-models
+            roots: "accounts/models.py accounts/mfa_trust.py accounts/management"
+            tests: "accounts tests.test_mfa tests.test_rbac_foundation tests.test_superadmin_tier"
+          - name: auth-accounts-views
+            roots: "accounts/views.py accounts/serializers.py accounts/urls.py"
+            tests: "accounts tests.test_e2e_auth_recovery tests.test_csrf_security tests.test_throttle_shared_cache"
+          - name: auth-common-permissions
+            roots: "common/permissions.py common/roles.py"
+            tests: "tests.test_rbac_foundation tests.test_superadmin_tier tests.test_staff_roles_admin tests.test_admin_rbac"
+          - name: auth-common-session
+            roots: "common/authentication.py common/middleware.py common/errors.py"
+            tests: "tests.test_csrf_security tests.test_correlation_ids tests.test_error_envelope tests.test_nonobject_bodies tests.test_nonobject_bodies_accounts"
+          - name: auth-common-totp-audit
+            roots: "common/totp.py common/qr.py common/audit.py common/onboarding.py common/saved_filters.py common/admin_search.py"
+            tests: "tests.test_mfa tests.test_audit_log tests.test_audit_structured tests.test_audit_trail tests.test_admin_onboarding tests.test_admin_saved_filters tests.test_admin_global_search"
+          - name: payments-intent-webhook
+            roots: "orders/views/payment.py orders/webhooks.py"
+            tests: "orders orders.tests_webhooks orders.test_idempotency tests.test_e2e_purchase_flow"
+          - name: payments-state
+            roots: "orders/state.py orders/models.py orders/serializers.py"
+            tests: "orders orders.tests_state_vocabulary tests.test_e2e_purchase_flow orders.test_idempotency"
+          - name: payments-refunds-returns
+            roots: "orders/refunds.py orders/views/refund.py orders/views/return.py"
+            tests: "orders orders.tests_refunds orders.tests_refund_requests orders.tests_returns orders.tests_gate0_refund_race"
+          - name: orders-checkout
+            roots: "orders/views/checkout.py orders/views/order.py orders/views/admin.py orders/urls.py"
+            tests: "orders tests.test_checkout_refresh orders.tests_guest orders.test_order_number orders.tests_checkout_auth"
+          - name: inventory-core
+            roots: "orders/inventory.py products/models.py products/views.py products/serializers.py"
+            tests: "orders products tests.test_stock_at_creation tests.test_expire_reservations tests.test_e2e_concurrency tests.test_postgres_row_locking"
+          - name: inventory-cart
+            roots: "cart/"
+            tests: "cart tests.test_e2e_purchase_flow tests.test_e2e_isolation"
+          - name: catalog
+            roots: "products/restock_views.py products/urls.py"
+            tests: "products products.test_restock products.test_delist products.test_variant"
+          - name: shipping
+            roots: "shipping/"
+            tests: "shipping tests.test_e2e_purchase_flow"
+          - name: admin-ops
+            roots: "ops/"
+            tests: "ops tests.test_e2e_admin_ops tests.test_alerts tests.test_backup_db tests.test_restore_drill"
+          - name: core-config
+            roots: "config/ common/money.py common/notifications.py common/tasks.py common/models.py"
+            tests: "tests config"
+          - name: urls-cutover
+            roots: "config/urls.py accounts/urls.py orders/urls.py products/urls.py cart/urls.py shipping/urls.py"
+            tests: "tests.test_deployment_contract tests.test_settings_security tests.test_csrf_security tests.test_e2e_isolation tests.test_nonobject_bodies tests.test_error_envelope"
+    services:
+      postgres:
+        image: postgres:17.11-alpine
+        env:
+          POSTGRES_DB: perfume_store
+          POSTGRES_USER: perfume
+          POSTGRES_PASSWORD: ci_pg_only_not_a_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U perfume -d perfume_store"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DJANGO_DEBUG: "true"
+      DJANGO_SECRET_KEY: "audit-ci-only-not-a-secret"
+      DATABASE_URL: "postgres://perfume:ci_pg_only_not_a_secret@localhost:5432/perfume_store?sslmode=disable"
+      REDIS_URL: "redis://localhost:6379/0"
+      RAZORPAY_KEY_ID: "rzp_test_CI_DUMMY"
+      RAZORPAY_KEY_SECRET: "ci-dummy-secret"
+      RAZORPAY_WEBHOOK_SECRET: "ci-dummy-webhook-secret"
+      ALERT_CACHE_LOCATION: "/tmp/alert_cache"
+      EMAIL_BACKEND: "django.core.mail.backends.locmem.EmailBackend"
+      PYTHONIOENCODING: "utf-8"
+      TEST_LABELS: ${{ matrix.tests }}
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install pinned dependencies (includes mutmut==2.5.1)
+        run: pip install -r requirements.txt
+
+      - name: Scope this shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATHS="$(find ${{ matrix.roots }} \
+            -name '*.py' \
+            ! -path '*/migrations/*' \
+            ! -path '*/__pycache__/*' \
+            ! -path '*/tests/*' \
+            ! -name '__init__.py' \
+            ! -name 'test_*.py' \
+            ! -name 'tests*.py' | sort | paste -sd, -)"
+          if [ -z "${PATHS}" ]; then echo "no mutable paths for shard"; exit 1; fi
+          echo "shard=${{ matrix.name }}"
+          echo "paths=${PATHS}"
+          python - "$PATHS" <<'PY'
+          import pathlib, sys
+          p = pathlib.Path('pyproject.toml')
+          s = p.read_text()
+          paths = sys.argv[1]
+          out = []
+          replaced = False
+          for line in s.splitlines():
+              if line.startswith('paths_to_mutate = '):
+                  out.append(f'paths_to_mutate = "{paths}"')
+                  replaced = True
+              else:
+                  out.append(line)
+          if not replaced:
+              raise SystemExit('paths_to_mutate not found')
+          p.write_text('\n'.join(out) + '\n')
+          PY
+
+      - name: Coverage baseline for this shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/alert_cache
+          python -m coverage run manage.py test ${TEST_LABELS} --verbosity 0
+          test -f .coverage
+
+      - name: Run mutmut (not a gate; --CI exits 0 on survivors)
+        id: mutate
+        shell: bash
+        run: |
+          set -uo pipefail
+          python -m mutmut run \
+            --runner "python manage.py test ${TEST_LABELS} --verbosity 0" \
+            --CI
+          status=$?
+          echo "mutmut_exit=${status}"
+          exit "${status}"
+
+      - name: Publish shard summary
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p /tmp/alert_cache
+          python -m mutmut html >/dev/null 2>&1 || true
+          index="html/index.html"
+          {
+            echo "### audit-mutation-all — ${{ matrix.name }}"
+            echo
+            echo "Roots: \`${{ matrix.roots }}\`"
+            echo "Tests: \`${{ matrix.tests }}\`"
+            if [ -f "$index" ]; then
+              headline="$(grep -ao 'Killed [0-9]* out of [0-9]* mutants' "$index" | head -n1 || true)"
+              echo "Result: \`${headline:-unparsed}\`"
+            else
+              echo "Result: **NO REPORT** (harness failure, not a zero score)"
+            fi
+            echo
+            echo "Survivors are information. Triage each one as equivalent / missing assert / untested line / flaky / timeout."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Assert the checkout is untouched
+        if: always()
+        shell: bash
+        working-directory: .
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain)"
+          if [ -n "${dirty}" ]; then
+            echo "::error::mutation run wrote into the tree: ${dirty}"
+            exit 1
+          fi
+
+      - name: Upload shard report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-${{ matrix.name }}
+          path: |
+            backend/html/
+            backend/mutants/
+            backend/.mutmut-cache
+          if-no-files-found: ignore
+          retention-days: 14
+
+  frontend-mutate:
+    if: ${{ github.event.inputs.shard == '' || github.event.inputs.shard == 'frontend-lib' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    continue-on-error: true
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm install --no-save @stryker-mutator/core @stryker-mutator/vitest-runner
+      - run: npx stryker run
+      - name: Upload Stryker report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-frontend-lib
+          path: frontend/reports/mutation/
+          if-no-files-found: ignore
+          retention-days: 14
