@@ -88,6 +88,7 @@ jobs:
 
       - name: Copy backend/ into an out-of-tree sandbox
         shell: bash
+        working-directory: .
         run: |
           set -euo pipefail
           SANDBOX="${RUNNER_TEMP}/mutation-sandbox"
