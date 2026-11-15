@@ -18,63 +18,37 @@ permissions:
   contents: read
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      count: ${{ steps.set.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHARD="${{ github.event.inputs.shard }}"
+          if [ -z "${SHARD}" ]; then
+            jq -c '{include: .}' .github/mutation-shards.json > /tmp/matrix.json
+          else
+            jq -c --arg s "${SHARD}" '{include: [.[] | select(.name == $s)]}' .github/mutation-shards.json > /tmp/matrix.json
+          fi
+          count="$(jq '.include | length' /tmp/matrix.json)"
+          echo "count=${count}" >> "${GITHUB_OUTPUT}"
+          echo "matrix=$(cat /tmp/matrix.json)" >> "${GITHUB_OUTPUT}"
+          cat /tmp/matrix.json
+
   mutate:
-    if: ${{ github.event.inputs.shard == '' || github.event.inputs.shard == matrix.name }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     continue-on-error: true
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: auth-accounts-models
-            roots: "accounts/models.py accounts/mfa_trust.py accounts/management"
-            tests: "accounts tests.test_mfa tests.test_rbac_foundation tests.test_superadmin_tier"
-          - name: auth-accounts-views
-            roots: "accounts/views.py accounts/serializers.py accounts/urls.py"
-            tests: "accounts tests.test_e2e_auth_recovery tests.test_csrf_security tests.test_throttle_shared_cache"
-          - name: auth-common-permissions
-            roots: "common/permissions.py common/roles.py"
-            tests: "tests.test_rbac_foundation tests.test_superadmin_tier tests.test_staff_roles_admin tests.test_admin_rbac"
-          - name: auth-common-session
-            roots: "common/authentication.py common/middleware.py common/errors.py"
-            tests: "tests.test_csrf_security tests.test_correlation_ids tests.test_error_envelope tests.test_nonobject_bodies tests.test_nonobject_bodies_accounts"
-          - name: auth-common-totp-audit
-            roots: "common/totp.py common/qr.py common/audit.py common/onboarding.py common/saved_filters.py common/admin_search.py"
-            tests: "tests.test_mfa tests.test_audit_log tests.test_audit_structured tests.test_audit_trail tests.test_admin_onboarding tests.test_admin_saved_filters tests.test_admin_global_search"
-          - name: payments-intent-webhook
-            roots: "orders/views/payment.py orders/webhooks.py"
-            tests: "orders orders.tests_webhooks orders.test_idempotency tests.test_e2e_purchase_flow"
-          - name: payments-state
-            roots: "orders/state.py orders/models.py orders/serializers.py"
-            tests: "orders orders.tests_state_vocabulary tests.test_e2e_purchase_flow orders.test_idempotency"
-          - name: payments-refunds-returns
-            roots: "orders/refunds.py orders/views/refund.py orders/views/return.py"
-            tests: "orders orders.tests_refunds orders.tests_refund_requests orders.tests_returns orders.tests_gate0_refund_race"
-          - name: orders-checkout
-            roots: "orders/views/checkout.py orders/views/order.py orders/views/admin.py orders/urls.py"
-            tests: "orders tests.test_checkout_refresh orders.tests_guest orders.test_order_number orders.tests_checkout_auth"
-          - name: inventory-core
-            roots: "orders/inventory.py products/models.py products/views.py products/serializers.py"
-            tests: "orders products tests.test_stock_at_creation tests.test_expire_reservations tests.test_e2e_concurrency tests.test_postgres_row_locking"
-          - name: inventory-cart
-            roots: "cart/"
-            tests: "cart tests.test_e2e_purchase_flow tests.test_e2e_isolation"
-          - name: catalog
-            roots: "products/restock_views.py products/urls.py"
-            tests: "products products.test_restock products.test_delist products.test_variant"
-          - name: shipping
-            roots: "shipping/"
-            tests: "shipping tests.test_e2e_purchase_flow"
-          - name: admin-ops
-            roots: "ops/"
-            tests: "ops tests.test_e2e_admin_ops tests.test_alerts tests.test_backup_db tests.test_restore_drill"
-          - name: core-config
-            roots: "config/ common/money.py common/notifications.py common/tasks.py common/models.py"
-            tests: "tests config"
-          - name: urls-cutover
-            roots: "config/urls.py accounts/urls.py orders/urls.py products/urls.py cart/urls.py shipping/urls.py"
-            tests: "tests.test_deployment_contract tests.test_settings_security tests.test_csrf_security tests.test_e2e_isolation tests.test_nonobject_bodies tests.test_error_envelope"
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     services:
       postgres:
         image: postgres:17.11-alpine
