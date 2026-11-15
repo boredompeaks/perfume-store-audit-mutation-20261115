@@ -50,19 +50,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     services:
-      postgres:
-        image: postgres:17.11-alpine
-        env:
-          POSTGRES_DB: perfume_store
-          POSTGRES_USER: perfume
-          POSTGRES_PASSWORD: ci_pg_only_not_a_secret
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U perfume -d perfume_store"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
       redis:
         image: redis:7-alpine
         ports:
@@ -75,8 +62,8 @@ jobs:
     env:
       DJANGO_DEBUG: "true"
       DJANGO_SECRET_KEY: "audit-ci-only-not-a-secret"
-      DATABASE_URL: "postgres://perfume:ci_pg_only_not_a_secret@localhost:5432/perfume_store?sslmode=disable"
       REDIS_URL: "redis://localhost:6379/0"
+      DATABASE_URL: "sqlite:////tmp/mutation.sqlite3"
       RAZORPAY_KEY_ID: "rzp_test_CI_DUMMY"
       RAZORPAY_KEY_SECRET: "ci-dummy-secret"
       RAZORPAY_WEBHOOK_SECRET: "ci-dummy-webhook-secret"
@@ -99,10 +86,21 @@ jobs:
       - name: Install pinned dependencies (includes mutmut==2.5.1)
         run: pip install -r requirements.txt
 
+      - name: Copy backend/ into an out-of-tree sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          SANDBOX="${RUNNER_TEMP}/mutation-sandbox"
+          rm -rf "${SANDBOX}"
+          mkdir -p "${SANDBOX}"
+          tar -C backend --exclude=.git --exclude=venv --exclude=__pycache__ -cf - . | tar -C "${SANDBOX}" -xf -
+          test -f "${SANDBOX}/manage.py"
+
       - name: Scope this shard
         shell: bash
         run: |
           set -euo pipefail
+          cd "${RUNNER_TEMP}/mutation-sandbox"
           PATHS="$(find ${{ matrix.roots }} \
             -name '*.py' \
             ! -path '*/migrations/*' \
@@ -136,6 +134,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cd "${RUNNER_TEMP}/mutation-sandbox"
           mkdir -p /tmp/alert_cache
           python -m coverage run manage.py test ${TEST_LABELS} --verbosity 0
           test -f .coverage
@@ -145,6 +144,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          cd "${RUNNER_TEMP}/mutation-sandbox"
           python -m mutmut run \
             --runner "python manage.py test ${TEST_LABELS} --verbosity 0" \
             --CI
@@ -157,6 +157,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          cd "${RUNNER_TEMP}/mutation-sandbox"
           mkdir -p /tmp/alert_cache
           python -m mutmut html >/dev/null 2>&1 || true
           index="html/index.html"
@@ -193,9 +194,9 @@ jobs:
         with:
           name: mutation-${{ matrix.name }}
           path: |
-            backend/html/
-            backend/mutants/
-            backend/.mutmut-cache
+            ${{ runner.temp }}/mutation-sandbox/html/
+            ${{ runner.temp }}/mutation-sandbox/mutants/
+            ${{ runner.temp }}/mutation-sandbox/.mutmut-cache
           if-no-files-found: ignore
           retention-days: 14
 
