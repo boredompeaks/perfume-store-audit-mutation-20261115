@@ -287,7 +287,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  frontend-mutate:
+  frontend_mutate:
     needs: plan
     if: ${{ github.event.inputs.shard == '' || github.event.inputs.shard == 'frontend-lib' }}
     runs-on: ubuntu-latest
@@ -332,7 +332,7 @@ jobs:
           retention-days: 14
 
   summary:
-    needs: [plan, mutate]
+    needs: [plan, mutate, frontend_mutate]
     if: always() && needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
     steps:
@@ -342,7 +342,11 @@ jobs:
           set -euo pipefail
           echo "mutate matrix result: ${{ needs.mutate.result }}"
           if [ "${{ needs.mutate.result }}" != "success" ]; then
-            echo "::error::at least one shard did not complete; this is a harness failure, not a mutation score"
+            echo "::error::at least one backend shard did not complete; this is a harness failure, not a mutation score"
+            exit 1
+          fi
+          if [ "${{ needs.frontend_mutate.result }}" != "success" ] && [ "${{ needs.frontend_mutate.result }}" != "skipped" ]; then
+            echo "::error::the frontend mutation job did not complete"
             exit 1
           fi
           echo "All shards completed. Survivors are information; triage them before calling the campaign done."
