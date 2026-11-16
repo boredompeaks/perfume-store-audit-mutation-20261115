@@ -2,9 +2,26 @@ name: audit-mutation-all
 
 # One-time, pre-launch mutation campaign. NOT a merge gate.
 # Sharded by flow/cohesion so no single job carries the whole suite.
+#
+# V2 fixes the four shards that failed in V1:
+#   1. The product tree is cloned fresh from the public product repo at the
+#      requested ref. The scratch repo is only the workflow host, so it can
+#      never again be missing scripts/, Procfile, compose files or docs that
+#      the deployment-contract tests read.
+#   2. The whole product tree is copied into the sandbox, not just backend/.
+#      backend/tests/test_deployment_contract.py resolves REPO_ROOT as
+#      parents[2]; keeping backend/ at <sandbox>/backend makes that resolve to
+#      the sandbox root, which now contains the real repo-root files.
+#   3. PostgreSQL 17.11 is the only engine. SQLite serialises writes and has
+#      no row-level locking, so it cannot witness the oversell/TOCTOU class.
+#   4. orders.tests_gate0_refund_race is gone from the shard file; that module
+#      was deleted from the product tree and only survives in git history.
+#
 # Public scratch repo: GitHub-hosted runner minutes are not capped for public
 # repositories. Each job is independent; a survivor is information, not a red
-# build. A non-zero exit means the harness broke (red baseline, missing tool).
+# build. mutmut --CI exits 0 on survivors. A non-zero exit means the harness
+# broke (red baseline, missing tool, wrong engine), and the final summary job
+# makes that visible instead of hiding it behind continue-on-error.
 
 on:
   workflow_dispatch:
@@ -13,9 +30,21 @@ on:
         description: "Optional single shard name; empty = all shards"
         required: false
         default: ""
+      ref:
+        description: "Product git ref (branch, tag, or full SHA) to mutate"
+        required: true
+        default: "feat/add-frontend"
+      product_repo:
+        description: "Product repository URL (public)"
+        required: true
+        default: "https://github.com/boredompeaks/perfume-store-backend.git"
 
 permissions:
   contents: read
+
+concurrency:
+  group: audit-mutation-${{ github.event.inputs.ref }}
+  cancel-in-progress: false
 
 jobs:
   plan:
@@ -36,6 +65,10 @@ jobs:
             jq -c --arg s "${SHARD}" '{include: [.[] | select(.name == $s)]}' .github/mutation-shards.json > /tmp/matrix.json
           fi
           count="$(jq '.include | length' /tmp/matrix.json)"
+          if [ "${count}" -eq 0 ]; then
+            echo "::error::no shard matched '${SHARD}'"
+            exit 1
+          fi
           echo "count=${count}" >> "${GITHUB_OUTPUT}"
           echo "matrix=$(cat /tmp/matrix.json)" >> "${GITHUB_OUTPUT}"
           cat /tmp/matrix.json
@@ -45,11 +78,23 @@ jobs:
     if: needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     services:
+      postgres:
+        image: postgres:17.11-alpine
+        env:
+          POSTGRES_DB: perfume_store
+          POSTGRES_USER: perfume
+          POSTGRES_PASSWORD: ci_pg_only_not_a_secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U perfume -d perfume_store"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
       redis:
         image: redis:7-alpine
         ports:
@@ -62,8 +107,8 @@ jobs:
     env:
       DJANGO_DEBUG: "true"
       DJANGO_SECRET_KEY: "audit-ci-only-not-a-secret"
+      DATABASE_URL: "postgres://perfume:ci_pg_only_not_a_secret@localhost:5432/perfume_store"
       REDIS_URL: "redis://localhost:6379/0"
-      DATABASE_URL: "sqlite:////tmp/mutation.sqlite3"
       RAZORPAY_KEY_ID: "rzp_test_CI_DUMMY"
       RAZORPAY_KEY_SECRET: "ci-dummy-secret"
       RAZORPAY_WEBHOOK_SECRET: "ci-dummy-webhook-secret"
@@ -71,37 +116,77 @@ jobs:
       EMAIL_BACKEND: "django.core.mail.backends.locmem.EmailBackend"
       PYTHONIOENCODING: "utf-8"
       TEST_LABELS: ${{ matrix.tests }}
-    defaults:
-      run:
-        working-directory: backend
+      PRODUCT_REPO: ${{ github.event.inputs.product_repo }}
+      PRODUCT_REF: ${{ github.event.inputs.ref }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clone the product at the requested ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf product
+          if ! git clone --depth 1 --branch "${PRODUCT_REF}" "${PRODUCT_REPO}" product 2>/dev/null; then
+            rm -rf product
+            git clone "${PRODUCT_REPO}" product
+            git -C product checkout "${PRODUCT_REF}"
+          fi
+          test -f product/backend/manage.py
+          test -f product/scripts/pg_baseline.json
+          test -f product/Procfile
+          test -f product/docker-compose.yml
+          git -C product rev-parse HEAD | tee product-sha.txt
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
+          cache-dependency-path: product/backend/requirements.txt
 
       - name: Install pinned dependencies (includes mutmut==2.5.1)
+        working-directory: product/backend
         run: pip install -r requirements.txt
 
-      - name: Copy backend/ into an out-of-tree sandbox
+      - name: Copy the whole product tree into an out-of-tree sandbox
         shell: bash
-        working-directory: .
+        env:
+          SANDBOX: ${{ runner.temp }}/mutation-sandbox
         run: |
           set -euo pipefail
-          SANDBOX="${RUNNER_TEMP}/mutation-sandbox"
           rm -rf "${SANDBOX}"
           mkdir -p "${SANDBOX}"
-          tar -C backend --exclude=.git --exclude=venv --exclude=__pycache__ -cf - . | tar -C "${SANDBOX}" -xf -
-          test -f "${SANDBOX}/manage.py"
+          tar -C product \
+            --exclude=.git \
+            --exclude=node_modules \
+            --exclude=.next \
+            --exclude=__pycache__ \
+            -cf - . | tar -C "${SANDBOX}" -xf -
+          test -f "${SANDBOX}/backend/manage.py"
+          test -f "${SANDBOX}/scripts/pg_baseline.json"
+          test -f "${SANDBOX}/Procfile"
+
+      - name: Assert PostgreSQL is the engine
+        shell: bash
+        working-directory: ${{ runner.temp }}/mutation-sandbox/backend
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+          import django
+          django.setup()
+          from django.conf import settings
+          engine = settings.DATABASES["default"]["ENGINE"]
+          print(f"engine={engine}")
+          if "postgresql" not in engine:
+              raise SystemExit("NOT_POSTGRES: mutation must run on PostgreSQL")
+          PY
 
       - name: Scope this shard
         shell: bash
+        working-directory: ${{ runner.temp }}/mutation-sandbox/backend
         run: |
           set -euo pipefail
-          cd "${RUNNER_TEMP}/mutation-sandbox"
           PATHS="$(find ${{ matrix.roots }} \
             -name '*.py' \
             ! -path '*/migrations/*' \
@@ -131,11 +216,11 @@ jobs:
           p.write_text('\n'.join(out) + '\n')
           PY
 
-      - name: Coverage baseline for this shard
+      - name: Coverage baseline for this shard (PostgreSQL)
         shell: bash
+        working-directory: ${{ runner.temp }}/mutation-sandbox/backend
         run: |
           set -euo pipefail
-          cd "${RUNNER_TEMP}/mutation-sandbox"
           mkdir -p /tmp/alert_cache
           python -m coverage run manage.py test ${TEST_LABELS} --verbosity 0
           test -f .coverage
@@ -143,9 +228,9 @@ jobs:
       - name: Run mutmut (not a gate; --CI exits 0 on survivors)
         id: mutate
         shell: bash
+        working-directory: ${{ runner.temp }}/mutation-sandbox/backend
         run: |
           set -uo pipefail
-          cd "${RUNNER_TEMP}/mutation-sandbox"
           python -m mutmut run \
             --runner "python manage.py test ${TEST_LABELS} --verbosity 0" \
             --CI
@@ -156,17 +241,19 @@ jobs:
       - name: Publish shard summary
         if: always()
         shell: bash
+        working-directory: ${{ runner.temp }}/mutation-sandbox/backend
         run: |
           set -uo pipefail
-          cd "${RUNNER_TEMP}/mutation-sandbox"
           mkdir -p /tmp/alert_cache
           python -m mutmut html >/dev/null 2>&1 || true
           index="html/index.html"
           {
             echo "### audit-mutation-all — ${{ matrix.name }}"
             echo
+            echo "Product ref: \`${{ github.event.inputs.ref }}\`"
             echo "Roots: \`${{ matrix.roots }}\`"
             echo "Tests: \`${{ matrix.tests }}\`"
+            echo "Engine: \`postgresql\`"
             if [ -f "$index" ]; then
               headline="$(grep -ao 'Killed [0-9]* out of [0-9]* mutants' "$index" | head -n1 || true)"
               echo "Result: \`${headline:-unparsed}\`"
@@ -177,15 +264,14 @@ jobs:
             echo "Survivors are information. Triage each one as equivalent / missing assert / untested line / flaky / timeout."
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Assert the checkout is untouched
+      - name: Assert the product clone is untouched
         if: always()
         shell: bash
-        working-directory: .
         run: |
           set -euo pipefail
-          dirty="$(git status --porcelain)"
+          dirty="$(git -C product status --porcelain)"
           if [ -n "${dirty}" ]; then
-            echo "::error::mutation run wrote into the tree: ${dirty}"
+            echo "::error::mutation run wrote into the product clone: ${dirty}"
             exit 1
           fi
 
@@ -195,35 +281,68 @@ jobs:
         with:
           name: mutation-${{ matrix.name }}
           path: |
-            ${{ runner.temp }}/mutation-sandbox/html/
-            ${{ runner.temp }}/mutation-sandbox/mutants/
-            ${{ runner.temp }}/mutation-sandbox/.mutmut-cache
+            ${{ runner.temp }}/mutation-sandbox/backend/html/
+            ${{ runner.temp }}/mutation-sandbox/backend/mutants/
+            ${{ runner.temp }}/mutation-sandbox/backend/.mutmut-cache
           if-no-files-found: ignore
           retention-days: 14
 
   frontend-mutate:
+    needs: plan
     if: ${{ github.event.inputs.shard == '' || github.event.inputs.shard == 'frontend-lib' }}
     runs-on: ubuntu-latest
     timeout-minutes: 240
-    continue-on-error: true
-    defaults:
-      run:
-        working-directory: frontend
+    env:
+      PRODUCT_REPO: ${{ github.event.inputs.product_repo }}
+      PRODUCT_REF: ${{ github.event.inputs.ref }}
     steps:
       - uses: actions/checkout@v4
+      - name: Clone the product at the requested ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf product
+          if ! git clone --depth 1 --branch "${PRODUCT_REF}" "${PRODUCT_REPO}" product 2>/dev/null; then
+            rm -rf product
+            git clone "${PRODUCT_REPO}" product
+            git -C product checkout "${PRODUCT_REF}"
+          fi
+          test -f product/frontend/package.json
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
-      - run: npm ci --no-audit --no-fund
-      - run: npm install --no-save @stryker-mutator/core @stryker-mutator/vitest-runner
-      - run: npx stryker run
+          cache-dependency-path: product/frontend/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: product/frontend
+        run: npm ci --no-audit --no-fund
+      - name: Install Stryker
+        working-directory: product/frontend
+        run: npm install --no-save @stryker-mutator/core @stryker-mutator/vitest-runner
+      - name: Run Stryker
+        working-directory: product/frontend
+        run: npx stryker run
       - name: Upload Stryker report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mutation-frontend-lib
-          path: frontend/reports/mutation/
+          path: product/frontend/reports/mutation/
           if-no-files-found: ignore
           retention-days: 14
+
+  summary:
+    needs: [plan, mutate]
+    if: always() && needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail the run when any shard harness failed
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "mutate matrix result: ${{ needs.mutate.result }}"
+          if [ "${{ needs.mutate.result }}" != "success" ]; then
+            echo "::error::at least one shard did not complete; this is a harness failure, not a mutation score"
+            exit 1
+          fi
+          echo "All shards completed. Survivors are information; triage them before calling the campaign done."

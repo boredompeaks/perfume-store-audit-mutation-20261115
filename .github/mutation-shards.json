@@ -35,9 +35,14 @@
     "tests": "orders orders.tests_state_vocabulary tests.test_e2e_purchase_flow orders.test_idempotency"
   },
   {
-    "name": "payments-refunds-returns",
-    "roots": "orders/refunds.py orders/views/refund.py orders/views/return.py",
-    "tests": "orders orders.tests_refunds orders.tests_refund_requests orders.tests_returns orders.tests_gate0_refund_race"
+    "name": "payments-refunds",
+    "roots": "orders/refunds.py orders/views/refund.py",
+    "tests": "orders.tests_refunds orders.tests_refund_requests"
+  },
+  {
+    "name": "payments-returns",
+    "roots": "orders/views/return.py",
+    "tests": "orders.tests_returns"
   },
   {
     "name": "orders-checkout",
@@ -72,7 +77,7 @@
   {
     "name": "core-config",
     "roots": "config/ common/money.py common/notifications.py common/tasks.py common/models.py",
-    "tests": "tests config"
+    "tests": "tests.test_settings_security tests.test_deployment_contract tests.test_error_tracking tests.test_alerts tests.test_seed_demo"
   },
   {
     "name": "urls-cutover",
